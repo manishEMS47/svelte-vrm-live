@@ -6,6 +6,7 @@ type PhonemeTiming = {
 	phoneme: string;
 	start: number; // seconds
 	end: number; // seconds
+	intensity?: number; // 0..1 per-frame multiplier; used by amplitude-derived timings (60db)
 };
 
 // Emotion type based on LLM output
@@ -228,6 +229,51 @@ class LipSyncAnimator {
 	}
 }
 
+// --- AMPLITUDE-BASED LIP SYNC (fallback for providers without alignment, e.g. 60db) ---
+/**
+ * Derive lip-sync timings from an audio buffer's volume envelope.
+ *
+ * Providers like 60db return audio but no per-character alignment. We slice the
+ * waveform into short frames, compute per-frame RMS energy, normalize it, and
+ * emit one timing per frame that opens the mouth (Aa) proportional to loudness.
+ * Near-silent frames map to NEUTRAL so the mouth closes between words.
+ */
+function generateTimingsFromAmplitude(audioBuffer: AudioBuffer, frameMs = 70): PhonemeTiming[] {
+	const channel = audioBuffer.getChannelData(0);
+	const sampleRate = audioBuffer.sampleRate;
+	const frameSize = Math.max(1, Math.floor((sampleRate * frameMs) / 1000));
+
+	// Per-frame RMS energy.
+	const rmsValues: number[] = [];
+	for (let i = 0; i < channel.length; i += frameSize) {
+		const end = Math.min(i + frameSize, channel.length);
+		let sumSquares = 0;
+		for (let j = i; j < end; j++) {
+			sumSquares += channel[j] * channel[j];
+		}
+		rmsValues.push(Math.sqrt(sumSquares / (end - i)));
+	}
+
+	const maxRms = Math.max(1e-6, ...rmsValues);
+
+	const SILENCE_THRESHOLD = 0.08; // normalized; below this the mouth closes
+	const timings: PhonemeTiming[] = [];
+	for (let f = 0; f < rmsValues.length; f++) {
+		const norm = rmsValues[f] / maxRms; // 0..1
+		const start = (f * frameSize) / sampleRate;
+		const end = Math.min(((f + 1) * frameSize) / sampleRate, audioBuffer.duration);
+		timings.push({
+			phoneme: norm < SILENCE_THRESHOLD ? 'NEUTRAL' : 'A',
+			start,
+			end,
+			intensity: norm
+		});
+	}
+
+	console.log(`[TTS] Derived ${timings.length} amplitude-based timings (no provider alignment)`);
+	return timings;
+}
+
 // --- TTS WITH PHONEMES ---
 async function fetchSpeechWithPhonemes(
 	text: string
@@ -288,9 +334,15 @@ async function fetchSpeechWithPhonemes(
 		});
 	}
 
-	console.log(`[TTS] Extracted ${timings.length} phoneme timings`);
+	console.log(`[TTS] Extracted ${timings.length} phoneme timings (provider: ${data.provider})`);
 	if (timings.length > 0) {
 		console.log('[TTS] First few timings:', timings.slice(0, 5));
+	}
+
+	// Providers without alignment (e.g. 60db) return no phonemes — derive lip-sync
+	// timings from the decoded audio's amplitude envelope so behaviour stays consistent.
+	if (timings.length === 0) {
+		return { audioBuffer, timings: generateTimingsFromAmplitude(audioBuffer) };
 	}
 
 	return { audioBuffer, timings };
@@ -362,11 +414,15 @@ export async function speakWithLipsync(
 				console.log(`[TTS] Playing audio and ${timings.length} phoneme animations`);
 			}
 
-			// Schedule all lip sync animations using the improved phoneme mapping
-			timings.forEach(({ phoneme, start, end }) => {
+			// Schedule all lip sync animations using the improved phoneme mapping.
+			// `intensity` (0..1) is present on amplitude-derived timings (60db) and
+			// scales the mouth-open amount per frame; alignment timings (ElevenLabs)
+			// leave it undefined, so the configured intensity is used as-is.
+			timings.forEach(({ phoneme, start, intensity }) => {
 				const expressionWeights = phonemeToVRM[phoneme] || phonemeToVRM['NEUTRAL'];
+				const frameIntensity = finalConfig.intensity * (intensity ?? 1);
 				setTimeout(() => {
-					animator.setBlendedExpression(expressionWeights, finalConfig.intensity);
+					animator.setBlendedExpression(expressionWeights, frameIntensity);
 				}, start * 1000);
 			});
 
